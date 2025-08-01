@@ -1,0 +1,686 @@
+---
+title: "RCT ANALYSIS version 202"
+author: christine
+format: html
+editor: visual
+---
+
+## Data Preprocessing 
+
+#### Load the dataset 
+
+```{r}
+#| echo: false
+#load required packages 
+
+suppressPackageStartupMessages({
+  library(naniar)
+  library(tableone)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(mice)
+  library(VIM)
+  library(knitr)
+  library(mice)
+  library(emmeans)
+
+})
+
+```
+
+#### Load the dataset 
+
+```{r}
+#| echo: false
+# Load the dataset
+df <- read.csv("phase_4_dataset_updated.csv")
+
+# Drop row index column if present
+df <- df %>% select(-starts_with("X"))
+```
+
+#### Convert Categorical Variables to Factors 
+
+```{r}
+df <- df %>%
+  mutate(
+    treatment_group = factor(treatment_group, levels = c(0,1), labels = c("Control", "Treatment")),
+    gender = factor(gender, levels = c(0,1), labels = c("Male", "Female")),
+    trial_centre = factor(trial_centre),
+    treatment_guess = factor(treatment_guess, levels = c(0,1), labels = c("Control", "Treatment"))
+  )
+```
+
+#### Baseline Characteristics / Participant Characteristics
+
+The analysis included 2500 participants, 1232 in the control group and 1268 in the intervention group.
+
+There is gender discrepancies in the treatment and control group.There is gender discrepancies in the treatment and control groups. Randomization may have resulted in **gender imbalance**, so **gender should be included as a covariate** in adjusted models (like ANCOVA)
+
+```{r}
+# Compare baseline characteristics across treatment groups
+library(tableone)
+vars <- c("age", "gender", "bmi", "n_current_medications", "pain_score_baseline","app_interactions","phyiscal_activity")
+table1 <- CreateTableOne(vars = vars, strata = "treatment_group", data = df, factorVars = "gender")
+print(table1, showAllLevels = TRUE)
+```
+
+#### Blinding Integrity Assessment
+
+**Ho:** participants' guesses are independent of their actual treatment assignment( i.e, they are guessing at random). H1: Participant guesses are dependent on their actual assignment( i.e, they are guessing better than random). P-value of 0.4568 demonstrates weak evidence against the null hypothesis; this suggests that the blinding was effective.
+
+```{r}
+#chiq-test 
+chisq.test(table(df$treatment_group, df$treatment_guess))
+```
+
+#### Analysis of Covariates 
+
+```{r}
+# Compare continuous variables
+t.test(age ~ treatment_group, data = df)
+t.test(bmi ~ treatment_group, data = df)
+t.test(n_current_medications ~ treatment_group, data = df)
+
+# Compare categorical variables
+table_gender <- table(df$gender, df$treatment_group)
+chisq.test(table_gender)
+
+# Simple linear models to assess association with pain outcome
+summary(lm(pain_score_final ~ age, data = df))
+summary(lm(pain_score_final ~ bmi, data = df))
+summary(lm(pain_score_final ~ gender, data = df))
+summary(lm(pain_score_final ~ n_current_medications, data = df))
+summary(lm(pain_score_final ~ pain_score_baseline, data = df))
+
+# Install if needed
+
+library(car)
+
+# Run VIF (Variance Inflation Factor)
+model <- lm(pain_score_final ~ pain_score_baseline + age + gender + bmi + n_current_medications, data = df)
+vif(model)
+```
+
+### Shipiro-Wilk Normality test
+
+Both p values are less than 0.05, indicating strong evidence against the null hypothesis. We reject the null hypothesis that primary outcome measurement ( change in pain scores is not normally distributed in Control and treatment groups.
+
+```{r}
+# Control group
+shapiro.test(df$pain_score_diff[df$treatment_group == "Control"])
+
+# Treatment group
+shapiro.test(df$pain_score_diff[df$treatment_group == "Treatment"])
+```
+
+### Mann-Whitney U Test
+
+The p-value is extremely small. This means that there is strong evidence that the distribution of pain_score_diff differs significantly between the control and treatment group.
+
+The treatment group's density plot is positively skewed. We can deduce that the group experienced a significantly greater reduction in pain symptoms compared to the control group.
+
+The Mann–Whitney U test revealed a significant difference in pain score change between the treatment and control groups, **W = 956316, p-value \< 2.2e-16**. The **treatment group** (Mdn =1.8, IQR = 3.6) showed **greater improvement** than the control group (Mdn = 0.0, IQR = 2.0). The effect size was **r = 0.4308**, indicating a moderate effect.
+
+The effect size was calculated using the Mann–Whitney U test, with interpretation based on Cohen’s guidelines (Cohen, 1988), where **r = 0.10** is considered small, **r = 0.30** medium, and **r = 0.50** large. (3)(4)
+
+```{r}
+wilcox.test(pain_score_diff ~ treatment_group, data = df)
+```
+
+### Density Distribution of the Primary Outcome
+
+```{r}
+# Compute means
+control_mean <- mean(df$pain_score_final[df$treatment_group == "Control"], na.rm = TRUE)
+treatment_mean <- mean(df$pain_score_final[df$treatment_group == "Treatment"], na.rm = TRUE)
+
+# Density plot with mean lines and labels
+ggplot(df, aes(x = pain_score_final, fill = treatment_group)) +
+  geom_density(alpha = 0.4) +
+  geom_vline(xintercept = control_mean, color = "red", linetype = "dashed", linewidth = 1.2) +
+  geom_vline(xintercept = treatment_mean, color = "blue", linetype = "dashed", linewidth = 1.2) +
+  annotate("text", x = control_mean, y = 0.02, label = paste0("Mean (Control) = ", round(control_mean, 2)),
+           color = "red", angle = 90, vjust = -0.5, hjust = 0) +
+  annotate("text", x = treatment_mean, y = 0.02, label = paste0("Mean (Treatment) = ", round(treatment_mean, 2)),
+           color = "blue", angle = 90, vjust = -0.5, hjust = 0) +
+  labs(
+    title = "Density Plot of Final Pain Scores by Treatment Group",
+    x = "Pain Score Final",
+    y = "Density",
+    fill = "Group"
+  ) +
+  theme_minimal()
+
+  
+```
+
+### Complete Case Analysis (ANCOVA)
+
+```{r}
+# Ensure variables are properly formatted
+df$treatment_group <- factor(df$treatment_group, labels = c("Control", "Treatment"))
+df$gender <- factor(df$gender, labels = c("Male", "Female"))
+
+# Run ANCOVA using pain_score_final as the outcome
+ancova_model <- lm(
+  pain_score_final ~ treatment_group + pain_score_baseline + gender + bmi + age,
+  data = df
+)
+confint(ancova_model)
+
+# View model summary
+summary(ancova_model)
+```
+
+### Missing Data
+
+```{r}
+# check missing value
+colSums(is.na(df))
+
+# Create a missing flag variable (for pain_score_final)
+df$missing_final <- ifelse(is.na(df$pain_score_final), 1, 0)
+#View the proportion of missing by treatment_group
+df %>%
+  group_by(treatment_group) %>%
+  summarise(
+    n_total = n(),
+    n_missing = sum(missing_final),
+    missing_rate = mean(missing_final)
+  )
+```
+
+#### Testing MAR
+
+```{r}
+#testing MAR 
+#  MAR TEST(Logistic regression)
+mar_model <- glm(missing_final ~ age + gender + bmi + treatment_group +n_current_medications+ pain_score_baseline,
+                 data= df, family = binomial)
+summary(mar_model)
+```
+
+```{r}
+names(df)
+```
+
+### Imputing using MICE
+
+```{r}
+#select variables that will be included in the imputation model 
+
+vars <- c("pain_score_final",
+          "pain_score_baseline", "age", "gender", "bmi",
+          "n_current_medications", "treatment_group", "trial_centre")
+
+data <- df[, vars]
+
+
+#Methods & predictor matrix
+meth <- make.method(data)
+pred <- make.predictorMatrix(data)
+diag(pred) <- 0  # prevent self-prediction
+
+
+
+
+#pain_score_final (continuous) with PMM
+meth["pain_score_final"] <- "pmm"
+meth[""]
+
+# other variables will not be imputed 
+meth[c("pain_score_baseline","age","gender","bmi",
+       "n_current_medications","treatment_group","trial_centre")] <- ""
+
+#run MICE 
+
+imp <- mice(data = data,
+            m = 20,               # number of imputations
+            method = meth,
+            predictorMatrix = pred,
+            maxit = 40,
+            seed = 2025,
+            printFlag = FALSE)
+
+
+```
+
+## Research Question 1: Treatment Effectivenes: ANCOVA
+
+```{r}
+# ANCOVA on final pain score (adjusting for baseline, etc.)
+fit_ancova <- with(imp, lm(pain_score_final ~ treatment_group + pain_score_baseline +
+                                         age + gender + bmi + n_current_medications))
+pool_ancova <- pool(fit_ancova)
+summary(pool_ancova, conf.int = TRUE)
+```
+
+#### Residuals Normality
+
+```{r}
+fit <- with(imp, lm(pain_score_final ~ treatment_group + pain_score_baseline + age + gender + bmi))
+# Extract residuals from each imputation
+res_list <- lapply(fit$analyses, residuals)
+
+# Example: Q-Q plot for first imputed dataset’s residuals
+qqnorm(res_list[[1]]); qqline(res_list[[1]])
+
+# Or loop through a few imputed sets
+par(mfrow = c(2,2))
+for(i in 1:4) {
+  qqnorm(res_list[[i]], main = paste("QQ residuals, imp", i)); qqline(res_list[[i]])
+}
+par(mfrow = c(1,1))
+```
+
+#### HC3 robust SEs on imputed model
+
+```{r}
+library(sandwich); library(lmtest); library(mitools)
+
+fit_main <- with(imp, lm(pain_score_final ~ treatment_group + pain_score_baseline +
+                                     age + gender + bmi + n_current_medications))
+
+betas <- lapply(fit_main$analyses, coef)
+vcovs <- lapply(fit_main$analyses, function(m) vcovHC(m, type = "HC3"))
+
+rob_pooled <- MIcombine(betas, vcovs)
+summary(rob_pooled)
+```
+
+### Between-Group Comparisons of the Mean Difference at Baseline and Endpoint
+
+```{r}
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+#Take one completed imputed dataset for plotting (common practice for figures)
+dat_imp1 <- complete(imp, 1) %>%
+  mutate(
+    treatment_group = factor(treatment_group,
+                             levels = c("Control", "Treatment"),
+                             labels = c("Control", "Treatment"))
+  )
+
+#Reshape to long format and recode time points
+df_long_imp <- dat_imp1 %>%
+  pivot_longer(
+    cols = c(pain_score_baseline, pain_score_final),
+    names_to = "time_point",
+    values_to = "pain_score"
+  ) %>%
+  mutate(
+    time_point = case_when(
+    time_point == "pain_score_baseline" ~ "Baseline",
+    time_point == "pain_score_final" ~ "Endpoint",
+    TRUE ~ as.character(time_point)
+  ),
+    time_point = factor(time_point, levels = c("Baseline", "Endpoint"))
+  )
+
+#Count non-missing values per group
+label_data <- df_long_imp %>%
+  group_by(time_point, treatment_group) %>%
+  summarise(n = sum(!is.na(pain_score)), .groups = "drop")
+
+#Position labels below boxplots
+label_pos <- df_long_imp %>%
+  group_by(time_point) %>%
+  summarise(y_lab = min(pain_score, na.rm = TRUE) - 0.5, .groups = "drop")
+
+label_data <- label_data %>%
+  left_join(label_pos, by = "time_point")
+
+#Colour palette (colour-blind friendly)
+cols <- c("Control" = "#D55E00", "Treatment" = "#0072B2")
+
+#Plot
+ggplot(df_long_imp, aes(x = treatment_group, y = pain_score, fill = treatment_group)) +
+  geom_boxplot(width = 0.5, alpha = 0.9, outlier.shape = 16, outlier.alpha = 0.3) +
+  geom_text(data = label_data,
+            aes(label = paste0("n = ", n), y = y_lab),
+            inherit.aes = TRUE,
+            size = 3.5, vjust = 1) +
+  facet_wrap(~ time_point, strip.position = "bottom") +
+  scale_fill_manual(values = cols) +
+  labs(
+    x = NULL,
+    y = "Pain score",
+    title = "Pain scores by group at Baseline and Endpoint (imputed dataset)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    strip.placement = "outside",
+    strip.text = element_text(face = "bold", size = 11),
+    axis.text.x = element_text(size = 10),
+    legend.position = "none",
+    plot.title = element_text(face = "bold", size = 14)
+  )
+
+
+```
+
+## Research Question 2: Subgroup Analysis
+
+#### Gender
+
+Interaction Term: There was no evidence of a significant interaction between treatment and gender **(β = –0.027200 95% CI: –0.40 to 0.35, *p* = 0.89)**, suggesting that the treatment effect did not differ meaningfully between males and females.
+
+Treatment effect: Estimated treatment effects were similar across genders. Among males, the treatment was associated with a reduction of 2.14 units in final pain scores, while among females, the reduction was 2.17 units. ( change the numbers to exact ones)
+
+```{r}
+# Load necessary packages
+library(mice)
+library(emmeans)
+
+#Fit model across imputations
+gender_model <- with(imp, lm(pain_score_final ~ treatment_group * gender +
+                             pain_score_baseline + age + bmi))
+
+#Pool results for overall model summary
+gender_pooled <- pool(gender_model)
+summary(gender_pooled, conf.int = TRUE)
+
+
+#PLOT THE MEAN DIFFERENCE 
+#Use emmeans to get marginal means per gender-treatment group
+emm_gender <- emmeans(gender_model, ~ treatment_group | gender)
+# Compute pairwise comparisons within each gender
+contrast(emm_gender, method = "revpairwise")  # Or "pairwise" depending on direction
+
+
+#Convert to data frame
+emm_df <- as.data.frame(emm_gender)
+
+# PLOT 
+ggplot(emm_df, aes(x = gender, y = emmean, color = treatment_group, group = treatment_group)) +
+  geom_point(position = position_dodge(0.5), size = 3) +
+  geom_line(position = position_dodge(0.5), linewidth = 1.2) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL),
+                position = position_dodge(0.5), width = 0.2, linewidth = 1) +
+  scale_color_manual(values = c("Control" = "#D55E00", "Treatment" = "#0072B2")) +
+  labs(
+    title = "Final Pain Scores by Gender × Treatment Interaction",
+    x = "Gender",
+    y = "Adjusted Final Pain Score (Mean ± 95% CI)",
+    color = "Treatment Group"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 12),
+    axis.title.y = element_text(size = 11),
+    axis.title.x = element_text(size = 11),
+    #axis.text = element_text(size = 10),
+    panel.grid.major.y = element_line(color = "grey80")
+  )
+```
+
+#### BMI Category
+
+```{r}
+library(mice)
+library(dplyr)
+library(emmeans)
+library(ggplot2)
+
+#Convert imputed mids object to long format and add BMI group
+long_data <- complete(imp, "long", include = TRUE)
+
+# 2. Create BMI group using WHO cut-offs
+long_data <- long_data %>%
+  mutate(bmi_group = cut(bmi,
+                         breaks = c(-Inf, 24.9, 29.9, Inf),
+                         labels = c("Normal (≤24.9)", "Overweight (25–29.9)", "Obese (≥30)"),
+                         right = TRUE))
+
+#Calculate average sample size per treatment group × BMI group across imputations
+n_table <- long_data %>%
+  filter(.imp != 0) %>%  # exclude the original (non-imputed) dataset
+  group_by(.imp, treatment_group, bmi_group) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(treatment_group, bmi_group) %>%
+  summarise(n = round(mean(n)), .groups = "drop")  # average across imputations
+
+#Convert back to mids object
+imp_bmi <- as.mids(long_data)
+
+# Fit ANCOVA model
+bmi_model <- with(imp_bmi, lm(pain_score_final ~ treatment_group * bmi_group +
+                                            pain_score_baseline + gender + age))
+
+#Pool results (optional summary)
+pool_bmi <- pool(bmi_model)
+summary(pool_bmi, conf.int = TRUE)
+
+#Estimated marginal means
+bmi_emm <- emmeans(bmi_model, ~ treatment_group | bmi_group)
+bmi_emm_df <- as.data.frame(bmi_emm)
+
+#Merge sample size `n` into the estimated marginal means table
+bmi_emm_df <- bmi_emm_df %>%
+  left_join(n_table, by = c("treatment_group", "bmi_group"))
+
+# View final output table with n included
+print(bmi_emm_df)
+
+#Plot (without sample size labels)
+ggplot(bmi_emm_df, aes(x = bmi_group, y = emmean, color = treatment_group, group = treatment_group)) +
+  geom_point(position = position_dodge(0.5), size = 3) +
+  geom_line(position = position_dodge(0.5), linewidth = 1.2) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL),
+                position = position_dodge(0.5), width = 0.2, linewidth = 1) +
+  scale_color_manual(values = c("Control" = "#D55E00", "Treatment" = "#0072B2")) +
+  labs(
+    title = "Final Pain Scores by BMI x Treatment Interaction",
+    x = "BMI Category",
+    y = "Adjusted Final Pain Score (Mean ± 95% CI)",
+    color = "Treatment Group"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 12 ),
+    axis.title.y = element_text(size = 11),
+    axis.title.x = element_text(size = 11),
+    panel.grid.major.y = element_line(color = "grey80")
+  )
+
+# 11. Optional: Contrast treatment vs control within each BMI group
+contrast(bmi_emm, method = "pairwise", by = "bmi_group")
+```
+
+#### Age Group
+
+Using the Young-old group as the reference, interaction terms between treatment and age group were not statistically significant (Middle-old × Treatment: β = 0.15, 95% CI: –0.27 to 0.57, *p* = 0.49; Old-old × Treatment: β = –0.03, 95% CI: –0.51 to 0.45, *p* = 0.90), indicating a consistent treatment effect across age categories.
+
+Further explanation:
+
+The **positive estimate (+0.15)** for Middle-old suggests the **treatment effect is slightly less strong** in the Middle-old group compared to the Young-old, but this difference is **not statistically significant** (*p* = 0.49)
+
+The **negative estimate (–0.03)** for Old-old suggests the treatment effect might be **slightly stronger** (more negative), but again, this is **not significant** (*p* = 0.90).
+
+```{r}
+library(mice)
+library(dplyr)
+library(emmeans)
+library(ggplot2)
+
+#Convert mids object to long format and add age groups
+long_data <- complete(imp, "long", include = TRUE)
+
+# 2. Add age group column
+long_data <- long_data %>%
+  mutate(age_group = cut(age,
+                         breaks = c(-Inf, 64, 70, Inf),
+                         labels = c("Young-old (≤64)", "Middle-old (65–70)", "Old-old (≥71)"),
+                         right = TRUE))
+
+# 3. Calculate sample sizes per group (average across imputations)
+age_n_table <- long_data %>%
+  filter(.imp != 0) %>%  # exclude original dataset
+  group_by(.imp, treatment_group, age_group) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(treatment_group, age_group) %>%
+  summarise(n = round(mean(n)), .groups = "drop")
+
+# 4. Convert back to mids object
+imp <- as.mids(long_data)
+
+# 5. Fit ANCOVA model with interaction
+fit_agegroup <- with(imp, lm(pain_score_final ~ treatment_group * age_group +
+                                         pain_score_baseline + gender + bmi))
+
+# 6. Get marginal means
+emm_results <- emmeans(fit_agegroup, ~ treatment_group | age_group)
+emm_df <- as.data.frame(emm_results)
+
+# 7. Merge sample size into emm_df
+emm_df <- emm_df %>%
+  left_join(age_n_table, by = c("treatment_group", "age_group"))
+# Pool the model results and display interaction terms
+pool_agegroup <- pool(fit_agegroup)
+
+# View full model summary including interaction terms
+summary(pool_agegroup, conf.int = TRUE)
+
+
+# 8. Plot: Visualize adjusted means (consistent with BMI/Gender plots)
+ggplot(emm_df, aes(x = age_group, y = emmean, group = treatment_group, color = treatment_group)) +
+  geom_point(position = position_dodge(0.5), size = 3) +
+  geom_line(position = position_dodge(0.5), linewidth = 1.2) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL),
+                position = position_dodge(0.5), width = 0.2, linewidth = 1) +
+  scale_color_manual(values = c("Control" = "#D55E00", "Treatment" = "#0072B2")) +
+  labs(
+    title = "Final Pain Scores by Age x Treatment Interaction",
+    x = "Age Group",
+    y = "Adjusted Final Pain Score (Mean ± 95% CI)",
+    color = "Treatment Group"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 12),
+    axis.title.y = element_text(size = 11),
+    axis.title.x = element_text(size = 11),
+    panel.grid.major.y = element_line(color = "grey80")
+  )
+
+# Optional: View the table with sample sizes
+print(emm_df)
+
+```
+
+#### Recruitment/Trail Center
+
+```{r}
+# Load necessary packages
+library(mice)
+library(dplyr)
+library(emmeans)
+library(ggplot2)
+
+# Step 1: Prepare the long imputed dataset
+long_data <- complete(imp, "long", include = TRUE)
+
+# Ensure 'trial_centre' is a factor
+long_data$trial_centre <- as.factor(long_data$trial_centre)
+
+# Convert back to mids object
+imp_centre <- as.mids(long_data)
+
+# Step 2: Fit ANCOVA model with treatment × trial centre interaction
+centre_model <- with(imp_centre, lm(pain_score_final ~ treatment_group * trial_centre +
+                                    pain_score_baseline + age + gender + bmi))
+
+# Step 3: Pool and summarize results
+pool_centre <- pool(centre_model)
+summary(pool_centre, conf.int = TRUE)
+
+# Step 4: Estimated marginal means by treatment within centre
+centre_emm <- emmeans(centre_model, ~ treatment_group | trial_centre)
+centre_emm_df <- as.data.frame(centre_emm)
+
+# Step 5: Contrast treatment vs. control within each centre
+centre_contrasts <- contrast(centre_emm, method = "pairwise", by = "trial_centre")
+centre_contrast_df <- as.data.frame(centre_contrasts)
+
+# Step 6: Sample sizes for each group
+sample_sizes <- long_data %>%
+  group_by(trial_centre, treatment_group) %>%
+  summarise(n = n(), .groups = "drop")
+
+# Merge sample size into EMM table
+centre_emm_df <- left_join(centre_emm_df, sample_sizes, by = c("trial_centre", "treatment_group"))
+
+# Step 7: Visualisation
+ggplot(centre_emm_df, aes(x = trial_centre, y = emmean, group = treatment_group, color = treatment_group)) +
+  geom_point(position = position_dodge(0.5), size = 3) +
+  geom_line(position = position_dodge(0.5), linewidth = 1.2) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL),
+                position = position_dodge(0.5), width = 0.2, linewidth = 1) +
+  scale_color_manual(values = c("Control" = "#D55E00", "Treatment" = "#0072B2")) +
+  labs(
+    title = "Final Pain Scores by Recruitment Centre x Treatment Interaction",
+    x = "Recruitment Centre",
+    y = "Adjusted Final Pain Score (Mean ± 95% CI)",
+    color = "Treatment Group"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 12),
+    axis.title.y = element_text(size = 11),
+    axis.title.x = element_text(size = 11),
+    panel.grid.major.y = element_line(color = "grey80")
+  )
+
+# Optional: view the contrast results table
+print(centre_contrast_df)
+
+```
+
+##### Kruskal–Wallis test
+
+```{r}
+# Load necessary library
+library(dplyr)
+
+# Ensure trial_centre is a factor
+df$trial_centre <- as.factor(df$trial_centre)
+
+# Run Kruskal-Wallis test
+kruskal_result <- kruskal.test(n_current_medications ~ trial_centre, data = df)
+
+# View result
+print(kruskal_result)
+```
+
+##### Post hoc analysis
+
+```{r}
+# Load necessary packages
+library(FSA)        # for dunnTest
+library(dplyr)      # for data manipulation
+library(ggplot2)    # for plotting
+library(rstatix)    # optional for tidy output
+
+# Assuming 'df' is your original dataset with trial_centre and n_current_medications
+
+# Kruskal-Wallis test
+kruskal.test(n_current_medications ~ trial_centre, data = df)
+
+# Post hoc Dunn’s test with Holm adjustment
+dunn_results <- dunnTest(n_current_medications ~ trial_centre, data = df, method = "holm")
+
+# View tidy output
+dunn_df <- dunn_results$res
+print(dunn_df)
+```
+
+The `echo: false` option disables the printing of code (only output is displayed).
